@@ -482,4 +482,4 @@ spec:
                 targetPort: 15017
 ```
 
-Unfortunately, when a new "network" (e.g.: `network2` from `cluster2` is added to the mesh, you need to patch all the clusters with this new `meshNetworks` information.
+Unfortunately, when a new "network" (e.g.: `network2` from `cluster2`) is added to the mesh, you need to patch all the clusters with this new `meshNetworks` information.
