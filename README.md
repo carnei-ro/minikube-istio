@@ -342,3 +342,144 @@ kubectl exec --context="${CTX_CLUSTER3}" -n sample -c sleep \
     app=sleep -o jsonpath='{.items[0].metadata.name}')" \
     -- sh -c "while true; do curl -sS helloworld.sample:5000/hello; done"
 ```
+
+### AWS Gotcha
+
+By doing the same steps (about Istio, of course) on AWS clusters (create by KOPS or EKS) we face [this bug](https://github.com/istio/istio/issues/29359). One workaround (when using internal load balancers) is to create NLB, NLBs do not "cycle" their IPs. Although, after the NLB created, we need to "dig" the CNAME to get the IPs then configure the `meshNetwork` section.
+
+e.g: Create the cluster with this YAML:
+
+```yaml
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  meshConfig:
+    defaultConfig:
+      proxyMetadata:
+        ISTIO_META_DNS_CAPTURE: "true"
+        ISTIO_META_PROXY_XDS_VIA_AGENT: "true"
+  values:
+    global:
+      meshID: mesh1
+      multiCluster:
+        clusterName: cluster1
+      network: network1
+  components:
+    ingressGateways:
+      - enabled: true
+        name: istio-ingressgateway
+        k8s:
+          serviceAnnotations:
+            service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+            service.beta.kubernetes.io/aws-load-balancer-type: nlb
+            service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+      - name: istio-eastwestgateway
+        label:
+          istio: eastwestgateway
+          app: istio-eastwestgateway
+          topology.istio.io/network: network1
+        enabled: true
+        k8s:
+          serviceAnnotations:
+            service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+            service.beta.kubernetes.io/aws-load-balancer-type: nlb
+            service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+          env:
+            # sni-dnat adds the clusters required for AUTO_PASSTHROUGH mode
+            - name: ISTIO_META_ROUTER_MODE
+              value: "sni-dnat"
+            # traffic through this gateway should be routed inside the network
+            - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+              value: network1
+          service:
+            ports:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+              - name: tls
+                port: 15443
+                targetPort: 15443
+              - name: tls-istiod
+                port: 15012
+                targetPort: 15012
+              - name: tls-webhook
+                port: 15017
+                targetPort: 15017
+```
+
+Then get the CNAME: `dig +short $(kubectl --context="${CTX_CLUSTER1}" -n istio-system get services/istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')` and reconfigure the yaml:
+
+```diff
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  meshConfig:
+    defaultConfig:
+      proxyMetadata:
+        ISTIO_META_DNS_CAPTURE: "true"
+        ISTIO_META_PROXY_XDS_VIA_AGENT: "true"
+  values:
+    global:
+      meshID: mesh1
+      multiCluster:
+        clusterName: cluster1
+      network: network1
++     meshNetworks:
++       network1:
++         endpoints:
++           - fromRegistry: cluster1
++         gateways:
++           - address: 10.1.1.1
++             port: 15443
++           - address: 10.1.1.2
++             port: 15443
++           - address: 10.1.1.3
++             port: 15443
++           - address: 10.1.1.4
++             port: 15443
++           - address: 10.1.1.5
++             port: 15443
+  components:
+    ingressGateways:
+      - enabled: true
+        name: istio-ingressgateway
+        k8s:
+          serviceAnnotations:
+            service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+            service.beta.kubernetes.io/aws-load-balancer-type: nlb
+            service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+      - name: istio-eastwestgateway
+        label:
+          istio: eastwestgateway
+          app: istio-eastwestgateway
+          topology.istio.io/network: network1
+        enabled: true
+        k8s:
+          serviceAnnotations:
+            service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+            service.beta.kubernetes.io/aws-load-balancer-type: nlb
+            service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+          env:
+            # sni-dnat adds the clusters required for AUTO_PASSTHROUGH mode
+            - name: ISTIO_META_ROUTER_MODE
+              value: "sni-dnat"
+            # traffic through this gateway should be routed inside the network
+            - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+              value: network1
+          service:
+            ports:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+              - name: tls
+                port: 15443
+                targetPort: 15443
+              - name: tls-istiod
+                port: 15012
+                targetPort: 15012
+              - name: tls-webhook
+                port: 15017
+                targetPort: 15017
+```
+
+Unfortunately, when a new "network" (e.g.: `network2` from `cluster2` is added to the mesh, you need to patch all the clusters with this new `meshNetworks` information.
